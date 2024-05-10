@@ -9,16 +9,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from models.vgg import vgg13
-from main.config import parse_argument
+from settings.config import parse_argument
 import torch.utils.data as data_utils
 from torch.utils.data import DataLoader, Dataset, random_split
 import torch
 import torchvision
 from torchvision import models
 import torchvision.transforms as transforms
-from main.config import parse_argument
+from settings.config import parse_argument
 import copy
-from models.cnn import CNN
+# from models.cnn import CNN
 import os
 import json
 
@@ -95,12 +95,13 @@ class Train:
             return time_diff
         return self.iter_time
     
-    def learnMutual_model(self,model,neighbormondel,train_loader,optimizer,lr=0.1):
+    def learnMutual_model(self,models,node_id,model,neighbormondel,train_loader,optimizer,lr=0.1):
         if self.time_flag:
             torch.cuda.synchronize()
             start=time.perf_counter()
 
-        optimizer = optim.SGD(model.parameters(),lr=lr)
+        optimizer1 = optim.SGD(model.parameters(),lr=lr)
+        optimizer2 = optim.SGD(neighbormondel.parameters(),lr=lr)
 
         for image,label in train_loader:
             break
@@ -109,10 +110,18 @@ class Train:
         y_2= neighbormondel(image)
 
         loss_1 = F.cross_entropy(y_1,label)+self.kl_divergence(y_1,y_2.detach())
-
-        optimizer.zero_grad()
+        optimizer1.zero_grad()
         loss_1.backward()
-        optimizer.step()
+        optimizer1.step()
+
+        y_1 = model(image)
+        loss_2 = F.cross_entropy(y_2,label)+self.kl_divergence(y_2,y_1.detach())
+        optimizer2.zero_grad()
+        loss_2.backward()
+        optimizer2.step()
+
+        # modelの書き換え
+        models[node_id] = copy.deepcopy(neighbormondel)
 
         if self.time_flag:
             torch.cuda.synchronize()
@@ -121,12 +130,13 @@ class Train:
         else:
             return self.iter_time*2.0
     
-    def learnEnsamble_model(self,model,neighbormondel,train_loader,optimizer,lr=0.1):
+    def learnEnsamble_model(self,models,node_id,model,neighbormondel,train_loader,optimizer,lr=0.1):
         if self.time_flag:
             torch.cuda.synchronize()
             start=time.perf_counter()
 
-        optimizer = optim.SGD(model.parameters(),lr=lr)
+        optimizer1 = optim.SGD(model.parameters(),lr=lr)
+        optimizer2 = optim.SGD(neighbormondel.parameters(),lr=lr)
 
         for image,label in train_loader:
             break
@@ -136,9 +146,17 @@ class Train:
 
         loss_1 = F.cross_entropy(y_1,label)+self.kl_ensamble_divergence(y_1,y_2.detach())
 
-        optimizer.zero_grad()
+        optimizer1.zero_grad()
         loss_1.backward()
-        optimizer.step()
+        optimizer1.step()
+
+        y_1 = model(image)
+        loss_2 = F.cross_entropy(y_2,label)+self.kl_ensamble_divergence(y_2,y_1.detach())
+        optimizer2.zero_grad()
+        loss_2.backward()
+        optimizer2.step()
+
+        models[node_id] = copy.deepcopy(neighbormondel)
 
         if self.time_flag:
             torch.cuda.synchronize()
@@ -264,7 +282,7 @@ class Train:
         output={}
         transition_accuracies = []
 
-        for round_num in range(500):
+        for round_num in range(5000):
             if round_num%100==0:
                 print(round_num)
 
@@ -300,9 +318,9 @@ class Train:
             if self.training_method=="gossip":
                 time_diff = self.learn_model(models[node_id],train_iter,train_lrs[node_id])
             elif self.training_method=="mutual":
-                time_diff = self.learnMutual_model(models[node_id],models[dest],train_iter,train_lrs[node_id])
+                time_diff = self.learnMutual_model(models,node_id,models[node_id],models[dest],train_iter,train_lrs[node_id])
             elif self.training_method=="collaborative":
-                time_diff = self.learnEnsamble_model(models[node_id],models[dest],train_iter,train_lrs[node_id])
+                time_diff = self.learnEnsamble_model(models,node_id,models[node_id],models[dest],train_iter,train_lrs[node_id])
 
 
 
