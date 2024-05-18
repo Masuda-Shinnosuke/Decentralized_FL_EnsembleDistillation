@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from models.vgg import vgg13
-from settings.config import parse_argument
 import torch.utils.data as data_utils
 from torch.utils.data import DataLoader, Dataset, random_split
 import torch
@@ -17,6 +16,7 @@ import torchvision
 from torchvision import models
 import torchvision.transforms as transforms
 from settings.config import parse_argument
+from settings.datasetting import get_dataset
 import copy
 # from models.cnn import CNN
 import os
@@ -47,7 +47,7 @@ class Train:
         # テスト時のバッチサイズ
         self.test_batchsize = args.test_batchsize
         # ノード数
-        self.K = 10
+        self.worker_num = args.worker_num
         # 何イテレータごとに送信するか
         self.T = 1
         # 遅延 [秒]
@@ -62,10 +62,12 @@ class Train:
         self.iter_time = 0.102
         # 計算時間の計測をするか
         self.time_flag = False
-        # 最後にallreduceするのを出力するか
-        self.output_allreduce = True
         # Non-iid環境
         self.Non_iid = args.non_iid
+        self.alpha_size=args.alpha_size
+        self.alpha_label=args.alpha_label
+
+
 
 
     def learn_model(self, model, train_loader, optimizer, lr=0.1):
@@ -201,9 +203,16 @@ class Train:
         return test_accuracies
     
     def train(self):
-        if self.dataset=="cifar10":
-            class_labels = 10
-            channels = 3
+        if self.Non_iid==True:
+            federated_trainset,testset = get_dataset(self.worker_num,self.alpha_size,self.alpha_label)
+            train_iters = [torch.utils.data.DataLoader(federated_trainset[i], batch_size=self.batchsize, shuffle=True) for i in range(self.worker_num)]
+            test_loader = DataLoader(testset,batch_size=self.test_batchsize,shuffle=False)
+            train_infos = [Train_info(0.0, i) for i in range(self.worker_num)]
+            time_thre = 5
+
+
+
+        else:
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(0.5,0.5)
@@ -212,15 +221,13 @@ class Train:
             trainset = torchvision.datasets.CIFAR10(root="./data",train=True,download=True,transform=transform)
             testset = torchvision.datasets.CIFAR10(root="./data",train=False,download=True,transform=transform)
             
-            
-
 
             time_thre = 5
-            trains = torch.utils.data.random_split(trainset, [len(trainset) // self.K for _ in range(self.K)])
+            trains = torch.utils.data.random_split(trainset, [len(trainset) // self.worker_num for _ in range(self.worker_num)])
             # 分割した各データセットに対してDataLoaderオブジェクトを作る
-            train_iters = [torch.utils.data.DataLoader(trains[i], batch_size=self.batchsize, shuffle=True) for i in range(self.K)]
+            train_iters = [torch.utils.data.DataLoader(trains[i], batch_size=self.batchsize, shuffle=True) for i in range(self.worker_num)]
             test_loader = DataLoader(testset,batch_size=self.test_batchsize,shuffle=False)
-            train_infos = [Train_info(0.0, i) for i in range(self.K)]
+            train_infos = [Train_info(0.0, i) for i in range(self.worker_num)]
 
         if self.cnn == "vgg":
             self.model = vgg13()
@@ -233,20 +240,6 @@ class Train:
                 self.iter_time = 0.0442
             if self.batchsize == 64:
                 self.iter_time = 0.0337
-        if self.cnn == "CNN":
-
-            self.model = CNN(class_labels,128).to(self.device)
-
-            if self.batchsize == 512:
-                self.iter_time = 0.147
-            if self.batchsize == 256:
-                self.iter_time = 0.0781
-            if self.batchsize == 128:
-                self.iter_time = 0.0442
-            if self.batchsize == 64:
-                self.iter_time = 0.0337
-
-            
         
         # モデルをcpuに送る，モデルをディープコピーする，コピーされたモデルを計算グラフから切り離す
         # self.model_zero = copy.deepcopy(self.model)
@@ -255,34 +248,34 @@ class Train:
        
         # クラアイントモデル
         models = []
-        for _ in range(self.K):
+        for _ in range(self.worker_num):
             model_copy = copy.deepcopy(self.model)
             models.append(model_copy)
         
-        gradient_models = [None for i in range(self.K)]
+        gradient_models = [None for i in range(self.worker_num)]
 
-        time_pulls = (np.zeros((self.K, self.wide_bandwidth)))
+        time_pulls = (np.zeros((self.worker_num, self.wide_bandwidth)))
         
-        communication_end = np.zeros(self.K)
-        train_nums = np.zeros(self.K)
-        train_lrs = np.full(self.K, self.lr)
+        communication_end = np.zeros(self.worker_num)
+        train_nums = np.zeros(self.worker_num)
+        train_lrs = np.full(self.worker_num, self.lr)
 
-        wide_flags = np.zeros(self.K,dtype=bool)
+        wide_flags = np.zeros(self.worker_num,dtype=bool)
         wide_flags[:self.wide_node_size] = True
-        estimated_times = np.full(self.K, 60.0)
-        gradient_times = np.zeros(self.K)
+        estimated_times = np.full(self.worker_num, 60.0)
+        gradient_times = np.zeros(self.worker_num)
 
         comm_time = self.model_size * 1.049 * 8 / 1000.0 + self.latency
         comm_time2 = (self.model_size * 1.049 * 8 / (1000.0 * self.wide_bandwidth) + self.latency) * self.wide_bandwidth
-        comm_times = np.full((self.K, self.K), comm_time)
-        comm_times[:self.wide_node_size, :] = np.full(self.K, comm_time2 / self.wide_bandwidth)
-        nums = np.arange(self.K)
+        comm_times = np.full((self.worker_num, self.worker_num), comm_time)
+        comm_times[:self.wide_node_size, :] = np.full(self.worker_num, comm_time2 / self.wide_bandwidth)
+        nums = np.arange(self.worker_num)
 
         output_time = 0
         output={}
         transition_accuracies = []
 
-        for round_num in range(5000):
+        for round_num in range(50000):
             if round_num%100==0:
                 print(round_num)
 
@@ -290,16 +283,16 @@ class Train:
             start = train_info.time
             node_id = train_info.node_id
 
-            if int(node_id)>=self.K:
-                node_id-=self.K
-                dest = (int(node_id) - (int(node_id) % self.K)) // self.K
-                node_id %= self.K
+            if int(node_id)>=self.worker_num:
+                node_id-=self.worker_num
+                dest = (int(node_id) - (int(node_id) % self.worker_num)) // self.worker_num
+                node_id %= self.worker_num
                 gradient_models[node_id] = models[dest].copy(mode='copy').to_cpu()
                 continue
 
             if math.floor(start)-output_time >= time_thre:
                 output_time = math.floor(start)
-                node_accurcies = self.test_models_max(models,test_loader,0,self.K)
+                node_accurcies = self.test_models_max(models,test_loader,0,self.worker_num)
                 mean_worker_accuracy = np.mean(node_accurcies)
                 data = {
                     f"{output_time}":mean_worker_accuracy
